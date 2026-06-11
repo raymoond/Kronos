@@ -7,7 +7,7 @@ import pytest
 import torch
 from tqdm import tqdm
 
-from model import Kronos, KronosPredictor, KronosTokenizer
+from Kronos.src.model import Kronos, KronosPredictor, KronosTokenizer
 
 TEST_DATA_ROOT = Path(__file__).parent / "data"
 INPUT_DATA_PATH = TEST_DATA_ROOT / "regression_input.csv"

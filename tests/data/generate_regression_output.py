@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from model import Kronos, KronosPredictor, KronosTokenizer
+from Kronos.src.model import Kronos, KronosPredictor, KronosTokenizer
 
 
 TEST_DATA_ROOT = Path(__file__).parent

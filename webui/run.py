@@ -53,7 +53,7 @@ def main():
     # Check model availability
     try:
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from model import Kronos, KronosTokenizer, KronosPredictor
+        from Kronos.src.model import Kronos, KronosTokenizer, KronosPredictor
         print("✅ Kronos model library available")
         model_available = True
     except ImportError:

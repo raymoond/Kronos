@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kronos"
+version = "0.1.0"
+description = "A Foundation Model for the Language of Financial Markets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "ShiYu"},
+]
+keywords = [
+    "deep-learning",
+    "finance",
+    "time-series",
+    "transformer",
+    "foundation-model",
+    "quantitative-finance",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch>=2.0.0",
+    "einops==0.8.1",
+    "huggingface_hub==0.33.1",
+    "matplotlib==3.9.3",
+    "tqdm==4.67.1",
+    "safetensors==0.6.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/shiyu-coder/Kronos"
+Repository = "https://github.com/shiyu-coder/Kronos"
+Paper = "https://arxiv.org/abs/2508.02739"
+"Live Demo" = "https://shiyu-coder.github.io/Kronos-demo/"
+"Hugging Face" = "https://huggingface.co/NeoQuasar"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
