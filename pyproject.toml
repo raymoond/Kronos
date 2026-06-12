@@ -49,7 +49,7 @@ Paper = "https://arxiv.org/abs/2508.02739"
 "Hugging Face" = "https://huggingface.co/NeoQuasar"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["kronos"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
