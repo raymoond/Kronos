@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import sys
 sys.path.append("../")
 from model import Kronos, KronosTokenizer, KronosPredictor
+import quantlab.data.tencent_5min_download as min_download
 
 save_dir = "./examples/data"
 os.makedirs(save_dir, exist_ok=True)
@@ -44,6 +45,70 @@ PRED_LEN = 120
 T = 1.0
 TOP_P = 0.9
 SAMPLE_COUNT = 1
+
+
+
+def load_min_data(symbol: str) -> pd.DataFrame:
+    print(f"📥 Fetching {symbol} 5-minute data from Tencent ...")
+
+    max_retries = 3
+    code = None
+    qlib_symbol = symbol
+
+    if symbol.isdigit():
+        if symbol.startswith("6"):
+            prefix = "SH"
+        else:
+            prefix = "SZ"
+        qlib_symbol = f"{prefix}{symbol}"
+        code = min_download.qlib_to_tencent(qlib_symbol)
+    else:
+        code = min_download.qlib_to_tencent(symbol)
+
+    if code is None:
+        print(f"❌ Invalid symbol format: {symbol}.")
+        sys.exit(1)
+
+    payload = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            payload = min_download.fetch_json(code, 640, 20.0)
+            if payload:
+                break
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt}/{max_retries} failed: {e}")
+        time.sleep(1.5)
+
+    if payload is None:
+        print(f"❌ Failed to fetch data for {symbol} after {max_retries} attempts. Exiting.")
+        sys.exit(1)
+
+    item = payload.get("data", {}).get(code, {})
+    bars = item.get("m5") or []
+
+    if not bars:
+        print(f"❌ No m5 data found for {symbol}. Exiting.")
+        sys.exit(1)
+
+    df = min_download.normalize_rows(qlib_symbol, bars, "2000-01-01", "2099-12-31")
+
+    if df.empty:
+        print(f"❌ No data after normalization for {symbol}. Exiting.")
+        sys.exit(1)
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    numeric_cols = ["open", "high", "low", "close", "volume", "amount"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    print(f"✅ Data loaded: {len(df)} rows, range: {df['date'].min()} ~ {df['date'].max()}")
+    print("Data Head:")
+    print(df.head())
+
+    return df[["date", "open", "high", "low", "close", "volume", "amount"]]
+
 
 def load_data(symbol: str) -> pd.DataFrame:
     print(f"📥 Fetching {symbol} daily data from akshare ...")
@@ -96,7 +161,7 @@ def load_data(symbol: str) -> pd.DataFrame:
         print(f"⚠️  Fixed {open_bad.sum()} invalid open values.")
         df.loc[open_bad, "open"] = df["close"].shift(1)
         df["open"].fillna(df["close"], inplace=True)
-
+  
     # Fix missing amount
     if df["amount"].isna().all() or (df["amount"] == 0).all():
         df["amount"] = df["close"] * df["volume"]
@@ -109,10 +174,13 @@ def load_data(symbol: str) -> pd.DataFrame:
     return df
 
 
-def prepare_inputs(df):
+def prepare_inputs(df, freq="daily"):
     x_df = df.iloc[-LOOKBACK:][["open","high","low","close","volume","amount"]]
     x_timestamp = df.iloc[-LOOKBACK:]["date"]
-    y_timestamp = pd.bdate_range(start=df["date"].iloc[-1] + pd.Timedelta(days=1), periods=PRED_LEN)
+    if freq == "5min":
+        y_timestamp = pd.date_range(start=df["date"].iloc[-1] + pd.Timedelta(minutes=5), periods=PRED_LEN, freq="5min")
+    else:
+        y_timestamp = pd.bdate_range(start=df["date"].iloc[-1] + pd.Timedelta(days=1), periods=PRED_LEN)
     return x_df, pd.Series(x_timestamp), pd.Series(y_timestamp)
 
 def apply_price_limits(pred_df, last_close, limit_rate=0.1):
@@ -156,14 +224,14 @@ def plot_result(df_hist, df_pred, symbol):
     print(f"📊 Chart saved: {plot_path}")
 
 
-def predict_future(symbol):
+def predict_future(symbol, freq="daily"):
     print(f"🚀 Loading Kronos tokenizer:{TOKENIZER_PRETRAINED} model:{MODEL_PRETRAINED} ...")
     tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_PRETRAINED)
     model = Kronos.from_pretrained(MODEL_PRETRAINED)
     predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CONTEXT)
 
-    df = load_data(symbol)
-    x_df, x_timestamp, y_timestamp = prepare_inputs(df)
+    df = load_min_data(symbol) if freq == "5min" else load_data(symbol)
+    x_df, x_timestamp, y_timestamp = prepare_inputs(df, freq)
 
     print("🔮 Generating predictions ...")
 
@@ -201,8 +269,10 @@ def predict_future(symbol):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kronos stock prediction script")
     parser.add_argument("--symbol", type=str, default="300418", help="Stock code")
+    parser.add_argument("--freq", type=str, default="daily", choices=["5min", "daily"], help="Data frequency")
     args = parser.parse_args()
 
     predict_future(
         symbol=args.symbol,
+        freq=args.freq,
     )
