@@ -3,7 +3,8 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -17,29 +18,21 @@ from requests.exceptions import ConnectTimeout, ConnectionError
 from model import KronosTokenizer, Kronos, KronosPredictor
 import quantlab.data.tencent_5min_download as mins_download
 
+
+# ============================================================================
+# Config
+# ============================================================================
+
 @dataclass
 class Config:
-
-    ### for tencent stock 5min config
-    # REPO_PATH: Path = Path("./examples/demo")
-    # MODEL_PATH: str = "./examples/demo/models"
-    # SYMBOL: str = 'SH601600'
-    # INTERVAL: str = '5min'
-    # HIST_POINTS: int = 400 
-    # PRED_HORIZON: int = 50
-    # N_PREDICTIONS: int = 50
-    # VOL_WINDOW: int = 50
-
-    ### for binance crypto 1h config
     REPO_PATH: Path = Path("./examples/demo")
     MODEL_PATH: str = "./examples/demo/models"
     SYMBOL: str = 'BTCUSDT'
     INTERVAL: str = '1h'
-    HIST_POINTS: int = 360 
+    HIST_POINTS: int = 360
     PRED_HORIZON: int = 24
     N_PREDICTIONS: int = 30
     VOL_WINDOW: int = 24
-
 
     def interval_min(self) -> int:
         s = self.INTERVAL
@@ -66,14 +59,28 @@ class Config:
         return 'h'
 
     def cache_path(self, symbol=None, interval=None) -> Path:
-        return (self.REPO_PATH / f"{symbol or self.SYMBOL}_{interval or self.INTERVAL}.csv")
+        return self.REPO_PATH / f"{symbol or self.SYMBOL}_{interval or self.INTERVAL}.csv"
 
     def limit(self) -> int:
         return self.HIST_POINTS + self.VOL_WINDOW
 
 
-class StockCalendar:
-    
+# ============================================================================
+# Calendar (abstract product)
+# ============================================================================
+
+class Calendar(ABC):
+    @abstractmethod
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+        ...
+
+
+class CryptoCalendar(Calendar):
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+        return current_ts + step
+
+
+class StockCalendar(Calendar):
     @staticmethod
     def is_trading_day(t: pd.Timestamp) -> bool:
         return t.weekday() < 5
@@ -89,8 +96,7 @@ class StockCalendar:
         afternoon_end = pd.Timestamp('15:00').time()
         return (morning_start <= tm <= morning_end) or (afternoon_start <= tm <= afternoon_end)
 
-    @staticmethod
-    def next_bar(current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
         t = current_ts + step
         morning_start = pd.Timestamp('09:30').time()
         morning_end = pd.Timestamp('11:30').time()
@@ -114,81 +120,20 @@ class StockCalendar:
                 return t
 
 
-class TrendModel:
-    def __init__(self, config: Config):
-        self.config = config
-        self.predictor = None
+# ============================================================================
+# DataFetcher (abstract product)
+# ============================================================================
 
-    def load(self):
-        print("Loading Kronos model...")
-        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k", cache_dir=self.config.MODEL_PATH)
-        model = Kronos.from_pretrained("NeoQuasar/Kronos-mini", cache_dir=self.config.MODEL_PATH)
-
-        tokenizer.eval()
-        model.eval()
-        self.predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
-        print("Model loaded successfully.")
-        return self.predictor
-
-    def predict(self, df: pd.DataFrame, is_stock: bool = False):
-        if self.predictor is None:
-            raise RuntimeError("Model not loaded. Call load() first.")
-
-        last_timestamp = df['timestamps'].max()
-        print(f"hist last_timestamp: {last_timestamp}")
-        step = self.config.interval_step()
-        freq = self.config.interval_freq()
-
-        if is_stock:
-            new_timestamps = []
-            t = last_timestamp
-            while len(new_timestamps) < self.config.PRED_HORIZON:
-                t = StockCalendar.next_bar(t, step)
-                new_timestamps.append(t)
-            new_timestamps_index = pd.DatetimeIndex(new_timestamps)
-        else:
-            start_new_range = last_timestamp + step
-            new_timestamps_index = pd.date_range(
-                start=start_new_range,
-                periods=self.config.PRED_HORIZON,
-                freq=freq
-            )
-
-        y_timestamp = pd.Series(new_timestamps_index, name='y_timestamp')
-        x_timestamp = df['timestamps']
-        x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
-
-        with torch.no_grad():
-            print("Making main prediction (T=1.0)...")
-            begin_time = time.time()
-            pred_df = self.predictor.predict(
-                df=x_df, x_timestamp=x_timestamp, y_timestamp=y_timestamp,
-                pred_len=self.config.PRED_HORIZON, T=1.0, top_p=0.95,
-                sample_count=self.config.N_PREDICTIONS, verbose=True
-            )
-            print(f"Main prediction completed in {time.time() - begin_time:.2f} seconds.")
-            pred_df.to_csv(
-                self.config.REPO_PATH / f"{self.config.SYMBOL}_predictions_{datetime.now().strftime('%Y%m%d')}.csv",
-                index=True
-            )
-            close_preds_main = pred_df['close']
-            if isinstance(close_preds_main, pd.Series):
-                close_preds_main = close_preds_main.to_frame()
-            volume_preds_main = pred_df['volume']
-            if isinstance(volume_preds_main, pd.Series):
-                volume_preds_main = volume_preds_main.to_frame()
-            close_preds_volatility = close_preds_main
-
-        return close_preds_main, volume_preds_main, close_preds_volatility
+class DataFetcher(ABC):
+    @abstractmethod
+    def fetch(self, config: Config) -> pd.DataFrame:
+        ...
 
 
-class DataFetcher:
-    def __init__(self, config: Config):
-        self.config = config
-
-    def fetch_binance(self):
-        symbol, interval = self.config.SYMBOL, self.config.INTERVAL
-        limit = self.config.limit()
+class CryptoDataFetcher(DataFetcher):
+    def fetch(self, config: Config) -> pd.DataFrame:
+        symbol, interval = config.SYMBOL, config.INTERVAL
+        limit = config.limit()
 
         try:
             print(f"Fetching {limit} bars of {symbol} {interval} data from Binance...")
@@ -206,9 +151,8 @@ class DataFetcher:
             for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
                 df[col] = pd.to_numeric(df[col])
 
-            cache_path = self.config.cache_path()
+            cache_path = config.cache_path()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            # df_raw = pd.DataFrame(klines, columns=cols)
             df.to_csv(cache_path, index=False)
 
             data_end = df['timestamps'].max()
@@ -218,30 +162,10 @@ class DataFetcher:
         except (ConnectTimeout, ConnectionError) as e:
             print(f"\n !!! Network error connecting to Binance: {e}")
             print(f" !!! Falling back to local cached data.\n")
-            return self._load_binance_cache(symbol, interval, limit)
+            return self._load_cache(config, symbol, interval, limit)
 
-    def _load_binance_cache(self, symbol, interval, limit):
-        path = self.config.cache_path(symbol, interval)
-        if not path.exists():
-            raise FileNotFoundError(f"Local cache file not found: {path}")
-
-        print(f"Loading {limit} bars from local cache: {path}")
-        df = pd.read_csv(path)
-        df['timestamps'] = pd.to_datetime(df['timestamps'])
-        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
-            df[col] = pd.to_numeric(df[col])    
-
-        df = df.tail(limit).reset_index(drop=True)
-        data_start = df['timestamps'].min()
-        data_end = df['timestamps'].max()
-        hours_behind = (datetime.now(timezone.utc) - data_end).total_seconds() / 3600
-        print(f" !!! WARNING: Using cached data from {data_start} to {data_end}")
-        print(f" !!! Data is approximately {hours_behind:.1f} hours behind current time.")
-        print(f" !!! Binance API was unreachable. Predictions may be less accurate.\n")
-        return df
-
-    def _load_stock_cache(self, symbol, interval, limit):
-        path = self.config.cache_path(symbol, interval)
+    def _load_cache(self, config, symbol, interval, limit):
+        path = config.cache_path(symbol, interval)
         if not path.exists():
             raise FileNotFoundError(f"Local cache file not found: {path}")
 
@@ -254,16 +178,17 @@ class DataFetcher:
         df = df.tail(limit).reset_index(drop=True)
         data_start = df['timestamps'].min()
         data_end = df['timestamps'].max()
-        if data_end.tz is None:
-            data_end = data_end.tz_localize('Asia/Shanghai')
-        mins_behind = (pd.Timestamp.now('Asia/Shanghai') - data_end).total_seconds() / 3600
+        hours_behind = (datetime.now(timezone.utc) - data_end).total_seconds() / 3600
         print(f" !!! WARNING: Using cached data from {data_start} to {data_end}")
-        print(f" !!! Data is approximately {mins_behind:.1f} hours behind current time.")
+        print(f" !!! Data is approximately {hours_behind:.1f} hours behind current time.")
+        print(f" !!! Binance API was unreachable. Predictions may be less accurate.\n")
         return df
 
-    def fetch_stock_5min(self, symbol=None):
-        symbol = symbol or self.config.SYMBOL
-        limit = self.config.limit()
+
+class StockDataFetcher(DataFetcher):
+    def fetch(self, config: Config) -> pd.DataFrame:
+        symbol = config.SYMBOL
+        limit = config.limit()
 
         try:
             code = mins_download.qlib_to_tencent(symbol)
@@ -287,7 +212,7 @@ class DataFetcher:
             df['timestamps'] = pd.to_datetime(df['timestamps'])
             df = df[['timestamps', 'open', 'high', 'low', 'close', 'volume', 'amount']]
 
-            cache_path = self.config.cache_path(symbol, '5min')
+            cache_path = config.cache_path(symbol, '5min')
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(cache_path, index=False)
 
@@ -298,150 +223,51 @@ class DataFetcher:
         except Exception as e:
             print(f"\n !!! Error fetching from Tencent: {e}")
             print(f" !!! Falling back to local cached data.\n")
-            return self._load_stock_cache(symbol, '5min', limit)
+            return self._load_cache(config, symbol, '5min', limit)
 
-    def fetch(self, source='cache'):
-        if source == 'binance':
-            return self.fetch_binance()
-        elif source == 'tencent':
-            return self.fetch_stock_5min()
-        elif source == 'tencent-cache':
-            return self._load_stock_cache(self.config.SYMBOL, self.config.INTERVAL, self.config.limit())
-        else:
-            return self._load_binance_cache(self.config.SYMBOL, self.config.INTERVAL, self.config.limit())
+    def _load_cache(self, config, symbol, interval, limit):
+        path = config.cache_path(symbol, interval)
+        if not path.exists():
+            raise FileNotFoundError(f"Local cache file not found: {path}")
+
+        print(f"Loading {limit} bars from local cache: {path}")
+        df = pd.read_csv(path)
+        df['timestamps'] = pd.to_datetime(df['timestamps'])
+        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            df[col] = pd.to_numeric(df[col])
+
+        df = df.tail(limit).reset_index(drop=True)
+        data_start = df['timestamps'].min()
+        data_end = df['timestamps'].max()
+        if data_end.tz is None:
+            data_end = data_end.tz_localize('Asia/Shanghai')
+        mins_behind = (pd.Timestamp.now('Asia/Shanghai') - data_end).total_seconds() / 3600
+        print(f" !!! WARNING: Using cached data from {data_start} to {data_end}")
+        print(f" !!! Data is approximately {mins_behind:.1f} hours behind current time.")
+        return df
 
 
-class MetricsCalculator:
+# ============================================================================
+# ChartGenerator (abstract product)
+# ============================================================================
+
+class ChartGenerator(ABC):
+    @abstractmethod
+    def create_plot(self, hist_df: pd.DataFrame, close_preds_df: pd.DataFrame, volume_preds_df: pd.DataFrame):
+        ...
+
+
+class CryptoChartGenerator(ChartGenerator):
     def __init__(self, config: Config):
         self.config = config
 
-    def calculate(self, hist_df, close_preds_df, v_close_preds_df):
-        last_close = hist_df['close'].iloc[-1]
-        final_hour_preds = close_preds_df.iloc[-1]
-        upside_prob = (final_hour_preds > last_close).mean()
-        print(f"Upside Probability (24h): {upside_prob:.2%}")
-
-        hist_log_returns = np.log(hist_df['close'] / hist_df['close'].shift(1))
-        historical_vol = hist_log_returns.iloc[-self.config.VOL_WINDOW:].std()
-        amplification_count = 0
-        for col in v_close_preds_df.columns:
-            full_sequence = pd.concat([pd.Series([last_close]), v_close_preds_df[col]]).reset_index(drop=True)
-            pred_log_returns = np.log(full_sequence / full_sequence.shift(1))
-            predicted_vol = pred_log_returns.std()
-            if predicted_vol > historical_vol:
-                amplification_count += 1
-
-        vol_amp_prob = amplification_count / len(v_close_preds_df.columns)
-
-        print(f"Upside Probability (24h): {upside_prob:.2%}, Volatility Amplification Probability: {vol_amp_prob:.2%}")
-        return upside_prob, vol_amp_prob
-
-
-class ChartGenerator:
-    def __init__(self, config: Config):
-        self.config = config
-
-    def create_plot_minutes(self, hist_df, close_preds_df, volume_preds_df):
-        print("Generating A-share minute forecast chart...")
-
-        df = hist_df.sort_values('timestamps').reset_index(drop=True)
-        hist_time = df['timestamps']
-
-        freq = self.config.interval_freq()
-        print(f"Detected data frequency: {freq}")
-
-        full_start = hist_time.min().normalize()
-        full_end = (hist_time.max() + pd.Timedelta(days=2)).normalize()
-        all_times = pd.date_range(full_start, full_end, freq=freq, tz='Asia/Shanghai')
-        bars = all_times[all_times.map(StockCalendar.in_trading_hours)]
-
-        if hist_time.dt.tz is None:
-            hist_tz = hist_time.dt.tz_localize('Asia/Shanghai')
-        else:
-            hist_tz = hist_time.dt.tz_convert('Asia/Shanghai')
-
-        df_tz = df.set_index('timestamps')
-        df_tz.index = hist_tz
-        df_reindexed = df_tz.reindex(bars, method='ffill').reset_index()
-        df_reindexed.rename(columns={'index': 'timestamps'}, inplace=True)
-        df_reindexed = df_reindexed.dropna(subset=['close']).reset_index(drop=True)
-        df_reindexed['bar_idx'] = np.arange(len(df_reindexed))
-
-        sep_idx = df_reindexed['bar_idx'].iloc[-1]
-
-        step = self.config.interval_step()
-        last_bar_ts = df_reindexed['timestamps'].iloc[-1]
-        pred_bars = []
-        t = last_bar_ts
-        for _ in range(len(close_preds_df)):
-            t = StockCalendar.next_bar(t, step)
-            if df_reindexed['timestamps'].dt.tz is None:
-                t_local = t.tz_localize('Asia/Shanghai') if t.tz is None else t
-            else:
-                t_local = t.tz_convert('Asia/Shanghai') if t.tz else t.tz_localize('Asia/Shanghai')
-            delta = (t_local - last_bar_ts).total_seconds()
-            idx = sep_idx + delta / freq_sec
-            if idx >= 0:
-                pred_bars.append(idx)
-
-        pred_close = close_preds_df.values if hasattr(close_preds_df, 'values') else close_preds_df
-        pred_volume = volume_preds_df.values if hasattr(volume_preds_df, 'values') else volume_preds_df
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), sharex=True,
-                                        gridspec_kw={'height_ratios': [3, 1]})
-
-        ax1.plot(df_reindexed['bar_idx'], df_reindexed['close'], color='royalblue',
-                 label='Historical Price', linewidth=1.5)
-        if pred_bars:
-            ax1.plot(pred_bars, pred_close.mean(axis=1), color='darkorange', linestyle='-',
-                     label='Mean Forecast')
-            ax1.fill_between(pred_bars, pred_close.min(axis=1), pred_close.max(axis=1),
-                             color='darkorange', alpha=0.2, label='Forecast Range (Min-Max)')
-
-        ax1.set_title(f'{self.config.SYMBOL} Probabilistic Price & Volume Forecast ({freq})',
-                      fontsize=16, weight='bold')
-        ax1.set_ylabel('Price (CNY)')
-        ax1.legend()
-        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
-
-        ax2.bar(df_reindexed['bar_idx'], df_reindexed['volume'], color='skyblue',
-                label='Historical Volume', width=0.6)
-        if pred_bars:
-            ax2.bar(pred_bars, pred_volume.mean(axis=1), color='sandybrown',
-                    label='Mean Forecasted Volume', width=0.6)
-        ax2.set_ylabel('Volume')
-        ax2.legend()
-        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
-
-        df_reindexed['label_date'] = df_reindexed['timestamps'].dt.strftime('%m/%d\n%H:%M')
-        tick_positions = []
-        tick_labels = []
-        for date, group in df_reindexed.groupby(df_reindexed['timestamps'].dt.date):
-            g = group.reset_index(drop=True)
-            tick_positions.append(g['bar_idx'].iloc[0])
-            tick_labels.append(g['label_date'].iloc[0])
-            tick_positions.append(g['bar_idx'].iloc[-1])
-            tick_labels.append(g['label_date'].iloc[-1])
-
-        for ax in [ax1, ax2]:
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(tick_labels, fontsize=7)
-            ax.tick_params(axis='x', rotation=0)
-            ax.axvline(x=sep_idx, color='red', linestyle='--', linewidth=1.5, label='_nolegend_')
-
-        fig.tight_layout()
-        chart_path = self.config.REPO_PATH / 'prediction_chart.png'
-        fig.savefig(chart_path, dpi=120)
-        plt.close(fig)
-        print(f"Chart saved to: {chart_path}")
-
-    def create_plot_hours(self, hist_df, close_preds_df, volume_preds_df):
+    def create_plot(self, hist_df, close_preds_df, volume_preds_df):
         print("Generating comprehensive forecast chart...")
         fig, (ax1, ax2) = plt.subplots(
             2, 1, figsize=(15, 10), sharex=True,
             gridspec_kw={'height_ratios': [3, 1]}
         )
-
+    
         hist_time = hist_df['timestamps']
         last_hist_time = hist_time.iloc[-1]
         pred_time = pd.to_datetime(
@@ -481,6 +307,237 @@ class ChartGenerator:
         print(f"Chart saved to: {chart_path}")
 
 
+class StockChartGenerator(ChartGenerator):
+    def __init__(self, config: Config, calendar: StockCalendar):
+        self.config = config
+        self.calendar = calendar
+
+    def create_plot(self, hist_df, close_preds_df, volume_preds_df):
+        print("Generating stock comprehensive forecast chart...")
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(15, 10), sharex=True,
+            gridspec_kw={'height_ratios': [3, 1]}
+        )
+
+        hist_df = hist_df[hist_df['timestamps'].apply(StockCalendar.in_trading_hours)].reset_index(drop=True)
+        hist_time = hist_df['timestamps']
+        last_hist_time = hist_time.iloc[-1]
+        step = self.config.interval_step()
+
+        pred_time = []
+        t = last_hist_time
+        for _ in range(len(close_preds_df)):
+            t = self.calendar.next_bar(t, step)
+            pred_time.append(t)
+
+        all_time = list(hist_time) + pred_time
+        n_hist = len(hist_time)
+        x_hist = np.arange(n_hist)
+        x_pred = np.arange(n_hist, n_hist + len(pred_time))
+
+        ax1.plot(x_hist, hist_df['close'].values, color='royalblue', label='Historical Price', linewidth=1.5)
+        mean_preds = close_preds_df.mean(axis=1).values
+        ax1.plot(x_pred, mean_preds, color='darkorange', linestyle='-', label='Mean Forecast')
+        ax1.fill_between(x_pred,
+                         close_preds_df.min(axis=1).values, close_preds_df.max(axis=1).values,
+                         color='darkorange', alpha=0.2, label='Forecast Range (Min-Max)')
+        title = f'{self.config.SYMBOL} A-Share Probabilistic Price & Volume Forecast'
+        ax1.set_title(title, fontsize=16, weight='bold')
+        ax1.set_ylabel('Price (CNY)')
+        ax1.legend()
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        ax2.bar(x_hist, hist_df['volume'].values, color='skyblue', label='Historical Volume', width=0.8)
+        ax2.bar(x_pred, volume_preds_df.mean(axis=1).values, color='sandybrown',
+                label='Mean Forecasted Volume', width=0.8)
+        ax2.set_ylabel('Volume')
+        ax2.set_xlabel('Time')
+        ax2.legend()
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        for ax in [ax1, ax2]:
+            ax.axvline(x=n_hist - 0.5, color='red', linestyle='--', linewidth=1.5, label='_nolegend_')
+
+        n_ticks = min(20, len(all_time))
+        tick_pos = np.linspace(0, len(all_time) - 1, n_ticks, dtype=int)
+        ax2.set_xticks(tick_pos)
+        ax2.set_xticklabels([pd.Timestamp(all_time[i]).strftime('%m/%d\n%H:%M') for i in tick_pos])
+        ax2.tick_params(axis='x', rotation=0)
+
+        fig.tight_layout()
+        chart_path = self.config.REPO_PATH / 'prediction_chart.png'
+        fig.savefig(chart_path, dpi=120)
+        plt.close(fig)
+        print(f"Chart saved to: {chart_path}")
+
+
+# ============================================================================
+# MarketFactory (abstract factory)
+# ============================================================================
+
+class MarketFactory(ABC):
+    @abstractmethod
+    def create_config(self) -> Config:
+        ...
+
+    @abstractmethod
+    def create_calendar(self) -> Calendar:
+        ...
+
+    @abstractmethod
+    def create_data_fetcher(self) -> DataFetcher:
+        ...
+
+    @abstractmethod
+    def create_chart_generator(self, config: Config) -> ChartGenerator:
+        ...
+
+
+class CryptoMarketFactory(MarketFactory):
+    def create_config(self) -> Config:
+        return Config(
+            REPO_PATH=Path("./examples/demo"),
+            MODEL_PATH="./examples/demo/models",
+            SYMBOL='BTCUSDT',
+            INTERVAL='1h',
+            HIST_POINTS=360,
+            PRED_HORIZON=24,
+            N_PREDICTIONS=30,
+            VOL_WINDOW=24,
+        )
+
+    def create_calendar(self) -> Calendar:
+        return CryptoCalendar()
+
+    def create_data_fetcher(self) -> DataFetcher:
+        return CryptoDataFetcher()
+
+    def create_chart_generator(self, config: Config) -> ChartGenerator:
+        return CryptoChartGenerator(config)
+
+
+class StockMarketFactory(MarketFactory):
+    def create_config(self) -> Config:
+        return Config(
+            REPO_PATH=Path("./examples/demo"),
+            MODEL_PATH="./examples/demo/models",
+            SYMBOL='SH601600',
+            INTERVAL='5min',
+            HIST_POINTS=400,
+            PRED_HORIZON=50,
+            N_PREDICTIONS=50,
+            VOL_WINDOW=50,
+        )
+
+    def create_calendar(self) -> Calendar:
+        return StockCalendar()
+
+    def create_data_fetcher(self) -> DataFetcher:
+        return StockDataFetcher()
+
+    def create_chart_generator(self, config: Config) -> ChartGenerator:
+        calendar = self.create_calendar()
+        return StockChartGenerator(config, calendar)
+
+
+# ============================================================================
+# TrendModel (uses Calendar instead of is_stock branching)
+# ============================================================================
+
+class TrendModel:
+    def __init__(self, config: Config, calendar: Calendar):
+        self.config = config
+        self.calendar = calendar
+        self.predictor = None
+
+    def load(self):
+        print("Loading Kronos model...")
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k", cache_dir=self.config.MODEL_PATH)
+        model = Kronos.from_pretrained("NeoQuasar/Kronos-mini", cache_dir=self.config.MODEL_PATH)
+
+        tokenizer.eval()
+        model.eval()
+        self.predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+        print("Model loaded successfully.")
+        return self.predictor
+
+    def predict(self, df: pd.DataFrame):
+        if self.predictor is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        last_timestamp = df['timestamps'].max()
+        print(f"hist last_timestamp: {last_timestamp}")
+        step = self.config.interval_step()
+
+        new_timestamps = []
+        t = last_timestamp
+        while len(new_timestamps) < self.config.PRED_HORIZON:
+            t = self.calendar.next_bar(t, step)
+            new_timestamps.append(t)
+        new_timestamps_index = pd.DatetimeIndex(new_timestamps)
+
+        y_timestamp = pd.Series(new_timestamps_index, name='y_timestamp')
+        x_timestamp = df['timestamps']
+        x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
+
+        with torch.no_grad():
+            print("Making main prediction (T=1.0)...")
+            begin_time = time.time()
+            pred_df = self.predictor.predict(
+                df=x_df, x_timestamp=x_timestamp, y_timestamp=y_timestamp,
+                pred_len=self.config.PRED_HORIZON, T=1.0, top_p=0.95,
+                sample_count=self.config.N_PREDICTIONS, verbose=True
+            )
+            print(f"Main prediction completed in {time.time() - begin_time:.2f} seconds.")
+            pred_df.to_csv(
+                self.config.REPO_PATH / f"{self.config.SYMBOL}_predictions_{datetime.now().strftime('%Y%m%d')}.csv",
+                index=True
+            )
+            close_preds_main = pred_df['close']
+            if isinstance(close_preds_main, pd.Series):
+                close_preds_main = close_preds_main.to_frame()
+            volume_preds_main = pred_df['volume']
+            if isinstance(volume_preds_main, pd.Series):
+                volume_preds_main = volume_preds_main.to_frame()
+            close_preds_volatility = close_preds_main
+
+        return close_preds_main, volume_preds_main, close_preds_volatility
+
+
+# ============================================================================
+# MetricsCalculator (market-agnostic, unchanged)
+# ============================================================================
+
+class MetricsCalculator:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def calculate(self, hist_df, close_preds_df, v_close_preds_df):
+        last_close = hist_df['close'].iloc[-1]
+        final_hour_preds = close_preds_df.iloc[-1]
+        upside_prob = (final_hour_preds > last_close).mean()
+        print(f"Upside Probability (24h): {upside_prob:.2%}")
+
+        hist_log_returns = np.log(hist_df['close'] / hist_df['close'].shift(1))
+        historical_vol = hist_log_returns.iloc[-self.config.VOL_WINDOW:].std()
+        amplification_count = 0
+        for col in v_close_preds_df.columns:
+            full_sequence = pd.concat([pd.Series([last_close]), v_close_preds_df[col]]).reset_index(drop=True)
+            pred_log_returns = np.log(full_sequence / full_sequence.shift(1))
+            predicted_vol = pred_log_returns.std()
+            if predicted_vol > historical_vol:
+                amplification_count += 1
+
+        vol_amp_prob = amplification_count / len(v_close_preds_df.columns)
+
+        print(f"Upside Probability (24h): {upside_prob:.2%}, Volatility Amplification Probability: {vol_amp_prob:.2%}")
+        return upside_prob, vol_amp_prob
+
+
+# ============================================================================
+# HTMLUpdater (market-agnostic, unchanged)
+# ============================================================================
+
 class HTMLUpdater:
     def __init__(self, config: Config):
         self.config = config
@@ -516,6 +573,10 @@ class HTMLUpdater:
         print("HTML file updated successfully.")
 
 
+# ============================================================================
+# GitOperator (market-agnostic, unchanged)
+# ============================================================================
+
 class GitOperator:
     def __init__(self, config: Config):
         self.config = config
@@ -540,46 +601,48 @@ class GitOperator:
                 print(f"A Git error occurred:\n--- STDOUT ---\n{e.stdout}\n--- STDERR ---\n{e.stderr}")
 
 
+# ============================================================================
+# PredictionPipeline (uses MarketFactory to build components)
+# ============================================================================
+
 class PredictionPipeline:
-    def __init__(self, config: Config = None):
-        self.config = config or Config()
+    def __init__(self, factory: MarketFactory):
+        self.factory = factory
+        self.config = factory.create_config()
+        self.calendar = factory.create_calendar()
+        self.fetcher = factory.create_data_fetcher()
+        self.charts = factory.create_chart_generator(self.config)
         self.model = None
-        self.fetcher = DataFetcher(self.config)
         self.metrics = MetricsCalculator(self.config)
-        self.charts = ChartGenerator(self.config)
         self.html = HTMLUpdater(self.config)
-        self.git = GitOperator(self.config)
+        # self.git = GitOperator(self.config)
 
     def load_model(self):
-        kronos = TrendModel(self.config)
+        kronos = TrendModel(self.config, self.calendar)
         kronos.load()
         self.model = kronos
         return self.model
 
-    def run_once(self, source='cache', enable_git=False):
+    def run_once(self, enable_git=False):
         print("\n" + "=" * 60 + f"\nStarting update task at {datetime.now(timezone.utc)}\n" + "=" * 60)
 
-        df_full = self.fetcher.fetch(source)
+        df_full = self.fetcher.fetch(self.config)
         df_for_model = df_full.copy()
 
-        is_stock = source in ('tencent', 'tencent-cache')
-        close_preds, volume_preds, v_close_preds = self.model.predict(df_for_model, is_stock=is_stock)
+        close_preds, volume_preds, v_close_preds = self.model.predict(df_for_model)
 
         hist_df_for_plot = df_for_model.tail(self.config.HIST_POINTS)
         hist_df_for_metrics = df_for_model.tail(self.config.VOL_WINDOW)
 
         upside_prob, vol_amp_prob = self.metrics.calculate(hist_df_for_metrics, close_preds, v_close_preds)
 
-        if is_stock:
-            self.charts.create_plot_minutes(hist_df_for_plot, close_preds, volume_preds)
-        else:
-            self.charts.create_plot_hours(hist_df_for_plot, close_preds, volume_preds)
+        self.charts.create_plot(hist_df_for_plot, close_preds, volume_preds)
 
         self.html.update(upside_prob, vol_amp_prob)
 
-        if enable_git:
-            commit_message = f"Auto-update forecast for {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
-            self.git.commit_and_push(commit_message)
+        # if enable_git:
+        #     commit_message = f"Auto-update forecast for {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+        #     self.git.commit_and_push(commit_message)
 
         del df_full, df_for_model, close_preds, volume_preds, v_close_preds
         del hist_df_for_plot, hist_df_for_metrics
@@ -599,7 +662,7 @@ class PredictionPipeline:
                 time.sleep(sleep_seconds)
 
             try:
-                self.run_once(source='tencent')
+                self.run_once()
             except Exception as e:
                 print(f"\n!!!!!! A critical error occurred in the main task !!!!!!!")
                 print(f"Error: {e}")
@@ -611,8 +674,12 @@ class PredictionPipeline:
 
 
 if __name__ == '__main__':
-    pipeline = PredictionPipeline()
+    # Switch factory to change market:
+    #   CryptoMarketFactory() - for BTCUSDT 1h crypto prediction
+    #   StockMarketFactory()  - for SH601600 5min A-share prediction
+    factory = StockMarketFactory()
+        
+    pipeline = PredictionPipeline(factory)
     pipeline.load_model()
-    # pipeline.run_once(source='tencent-cache')
-    pipeline.run_once(source='cache')
+    pipeline.run_once()
     # pipeline.run_scheduler()
