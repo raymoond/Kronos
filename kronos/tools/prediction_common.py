@@ -1,14 +1,201 @@
-import pandas as pd
-import numpy as np
 import os
 import json
-from datetime import datetime, timedelta
+import re
+import subprocess
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
 import akshare as ak
 from tools.stock_data_fetcher import StockDataFetcher
+from model import KronosTokenizer, Kronos, KronosPredictor
 
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# Config Template
+# ============================================================================
+
+@dataclass
+class Config_template:
+    REPO_PATH: Path = Path("./examples/demo")
+    MODEL_PATH: str = "./examples/demo/models"
+    SYMBOL: str = 'BTCUSDT'
+    INTERVAL: str = '1h'
+    HIST_POINTS: int = 360
+    PRED_HORIZON: int = 24
+    N_PREDICTIONS: int = 30
+    VOL_WINDOW: int = 24
+
+    def interval_min(self) -> int:
+        s = self.INTERVAL
+        if s.endswith('min'):
+            return int(s.replace('min', ''))
+        if s.endswith('h'):
+            return int(s.replace('h', ''))
+        return 60
+
+    def interval_step(self) -> pd.Timedelta:
+        s = self.INTERVAL
+        if s.endswith('min'):
+            return pd.Timedelta(minutes=int(s.replace('min', '')))
+        if s.endswith('h'):
+            return pd.Timedelta(hours=int(s.replace('h', '')))
+        return pd.Timedelta(hours=1)
+
+    def interval_freq(self) -> str:
+        s = self.INTERVAL
+        if s.endswith('min'):
+            return s
+        if s.endswith('h'):
+            return s
+        return 'h'
+
+    def cache_path(self, symbol=None, interval=None) -> Path:
+        return self.REPO_PATH / f"{symbol or self.SYMBOL}_{interval or self.INTERVAL}.csv"
+
+    def limit(self) -> int:
+        return self.HIST_POINTS + self.VOL_WINDOW
+
+
+# ============================================================================
+# Calendar (abstract product)
+# ============================================================================
+
+class Calendar(ABC):
+    @abstractmethod
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+        ...
+
+
+class CryptoCalendar(Calendar):
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+        return current_ts + step
+
+
+class StockCalendar(Calendar):
+    @staticmethod
+    def is_trading_day(t: pd.Timestamp) -> bool:
+        return t.weekday() < 5
+
+    @staticmethod
+    def in_trading_hours(t: pd.Timestamp) -> bool:
+        if not StockCalendar.is_trading_day(t):
+            return False
+        tm = t.time()
+        morning_start = pd.Timestamp('09:30').time()
+        morning_end = pd.Timestamp('11:30').time()
+        afternoon_start = pd.Timestamp('13:00').time()
+        afternoon_end = pd.Timestamp('15:00').time()
+        return (morning_start <= tm <= morning_end) or (afternoon_start <= tm <= afternoon_end)
+
+    def next_bar(self, current_ts: pd.Timestamp, step: pd.Timedelta) -> pd.Timestamp:
+        t = current_ts + step
+        morning_start = pd.Timestamp('09:30').time()
+        morning_end = pd.Timestamp('11:30').time()
+        afternoon_start = pd.Timestamp('13:00').time()
+        afternoon_end = pd.Timestamp('15:00').time()
+
+        while True:
+            if t.weekday() >= 5:
+                t += pd.Timedelta(days=(7 - t.weekday()))
+                t = t.replace(hour=9, minute=30, second=0, microsecond=0)
+                continue
+            tm = t.time()
+            if tm < morning_start:
+                t = t.replace(hour=9, minute=30, second=0, microsecond=0)
+            elif morning_end < tm < afternoon_start:
+                t = t.replace(hour=13, minute=0, second=0, microsecond=0)
+            elif tm > afternoon_end:
+                t += pd.Timedelta(days=1)
+                t = t.replace(hour=9, minute=30, second=0, microsecond=0)
+            else:
+                return t
+
+
+# ============================================================================
+# HTMLUpdater (market-agnostic)
+# ============================================================================
+
+class HTMLUpdater:
+    def __init__(self, config):
+        self.config = config
+
+    def update(self, upside_prob, vol_amp_prob):
+        print("Updating index.html...")
+        html_path = self.config.REPO_PATH / 'index.html'
+        now_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        upside_prob_str = f'{upside_prob:.1%}'
+        vol_amp_prob_str = f'{vol_amp_prob:.1%}'
+
+        with open(html_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        content = re.sub(
+            r'(<strong id="update-time">).*?(</strong>)',
+            lambda m: f'{m.group(1)}{now_utc_str}{m.group(2)}',
+            content
+        )
+        content = re.sub(
+            r'(<p class="metric-value" id="upside-prob">).*?(</p>)',
+            lambda m: f'{m.group(1)}{upside_prob_str}{m.group(2)}',
+            content
+        )
+        content = re.sub(
+            r'(<p class="metric-value" id="vol-amp-prob">).*?(</p>)',
+            lambda m: f'{m.group(1)}{vol_amp_prob_str}{m.group(2)}',
+            content
+        )
+
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print("HTML file updated successfully.")
+
+
+# ============================================================================
+# GitOperator (market-agnostic)
+# ============================================================================
+
+class GitOperator:
+    def __init__(self, config):
+        self.config = config
+
+    def commit_and_push(self, commit_message):
+        print("Performing Git operations...")
+        try:
+            os.chdir(self.config.REPO_PATH)
+            subprocess.run(['git', 'add', 'prediction_chart.png', 'index.html'],
+                           check=True, capture_output=True, text=True)
+            commit_result = subprocess.run(['git', 'commit', '-m', commit_message],
+                                           check=True, capture_output=True, text=True)
+            print(commit_result.stdout)
+            push_result = subprocess.run(['git', 'push'], check=True, capture_output=True, text=True)
+            print(push_result.stdout)
+            print("Git push successful.")
+        except subprocess.CalledProcessError as e:
+            output = e.stdout if e.stdout else e.stderr
+            if "nothing to commit" in output or "Your branch is up to date" in output:
+                print("No new changes to commit or push.")
+            else:
+                print(f"A Git error occurred:\n--- STDOUT ---\n{e.stdout}\n--- STDERR ---\n{e.stderr}")
+
+
+def load_model(model_path, device="cuda:0"):
+    print("Loading Kronos model...")
+    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k", cache_dir=model_path)
+    model = Kronos.from_pretrained("NeoQuasar/Kronos-mini", cache_dir=model_path)
+    tokenizer.eval()
+    model.eval()
+    predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+    print("Model loaded successfully.")
+    return predictor
 
 
 def ensure_output_directory(output_dir):

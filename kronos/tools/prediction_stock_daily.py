@@ -25,12 +25,12 @@ import os
 import argparse
 import time
 import pandas as pd
-import akshare as ak
 import matplotlib.pyplot as plt
 import sys
 sys.path.append("../")
 from model import Kronos, KronosTokenizer, KronosPredictor
 import quantlab.data.tencent_5min_download as min_download
+from stock_data_fetcher import StockDataFetcher
 
 save_dir = "./examples/data"
 os.makedirs(save_dir, exist_ok=True)
@@ -111,63 +111,46 @@ def load_min_data(symbol: str) -> pd.DataFrame:
 
 
 def load_data(symbol: str) -> pd.DataFrame:
-    print(f"📥 Fetching {symbol} daily data from akshare ...")
+    print(f"📥 Fetching {symbol} daily data ...")
 
-    max_retries = 3
-    df = None
+    fetcher = StockDataFetcher(
+        stock_code=symbol,
+        full_history=True,
+    )
+    df = fetcher.fetch()
 
-    # Retry mechanism
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="")
-            if df is not None and not df.empty:
-                break
-        except Exception as e:
-            print(f"⚠️ Attempt {attempt}/{max_retries} failed: {e}")
-        time.sleep(1.5)
-
-    # If still empty after retries
     if df is None or df.empty:
-        print(f"❌ Failed to fetch data for {symbol} after {max_retries} attempts. Exiting.")
+        print(f"❌ Failed to fetch data for {symbol}. Exiting.")
         sys.exit(1)
-    
-    df.rename(columns={
-        "日期": "date",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
+
+    df = df.rename(columns={
+        "开盘价": "open",
+        "收盘价": "close",
+        "最高价": "high",
+        "最低价": "low",
         "成交量": "volume",
-        "成交额": "amount"
-    }, inplace=True)
+        "成交额": "amount",
+    })
+
+    df = df.reset_index().rename(columns={"日期": "date"})
 
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Convert numeric columns
     numeric_cols = ["open", "high", "low", "close", "volume", "amount"]
     for col in numeric_cols:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .replace({"--": None, "": None})
-        )
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Fix invalid open values
     open_bad = (df["open"] == 0) | (df["open"].isna())
     if open_bad.any():
         print(f"⚠️  Fixed {open_bad.sum()} invalid open values.")
         df.loc[open_bad, "open"] = df["close"].shift(1)
         df["open"].fillna(df["close"], inplace=True)
-  
-    # Fix missing amount
+
     if df["amount"].isna().all() or (df["amount"] == 0).all():
         df["amount"] = df["close"] * df["volume"]
 
     print(f"✅ Data loaded: {len(df)} rows, range: {df['date'].min()} ~ {df['date'].max()}")
-
     print("Data Head:")
     print(df.head())
 
@@ -269,7 +252,7 @@ def predict_future(symbol, freq="daily"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kronos stock prediction script")
     parser.add_argument("--symbol", type=str, default="300418", help="Stock code")
-    parser.add_argument("--freq", type=str, default="daily", choices=["5min", "daily"], help="Data frequency")
+    parser.add_argument("--freq", type=str, default="5min", choices=["5min", "daily"], help="Data frequency")
     args = parser.parse_args()
 
     predict_future(
