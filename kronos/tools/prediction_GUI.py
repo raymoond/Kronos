@@ -17,16 +17,13 @@ from tools.prediction_common import (
     calculate_prediction_parameters, generate_trading_dates_only,
     calculate_optimal_interval, EnhancedMarketFactorAnalyzer,
     enhance_prediction_with_market_factors,
-    create_comprehensive_market_report
+    create_comprehensive_market_report,
+    load_model,
 )
 
 warnings.filterwarnings('ignore')
 
 sys.path.append("../")
-try:
-    from model import Kronos, KronosTokenizer, KronosPredictor
-except ImportError:
-    print("⚠️ 无法导入Kronos模型，预测功能将不可用")
 
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
@@ -538,19 +535,16 @@ def run_comprehensive_prediction_gui(stock_code, stock_name, data_dir, pred_days
 
         # 2. 加载模型和分词器
         update_progress("\n步骤2: 加载Kronos模型和分词器...")
-        try:
-            tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-            model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
-            update_progress("✅ 模型加载完成 - 使用Kronos-base模型")
-        except Exception as e:
-            error_msg = f"❌ 模型加载失败: {e}"
+        predictor = load_model(device="cuda:0", model_type="base")
+        if predictor is None:
+            error_msg = "❌ 模型加载失败"
             update_result(error_msg)
             update_progress("⚠️ 预测功能不可用，请检查模型安装")
             return False, error_msg
+        update_progress("✅ 模型加载完成 - 使用Kronos-base模型")
 
         # 3. 实例化预测器
         update_progress("步骤3: 初始化预测器...")
-        predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
         update_progress("✅ 预测器初始化完成")
 
         # 4. 准备数据

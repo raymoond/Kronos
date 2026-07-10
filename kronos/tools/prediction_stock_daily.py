@@ -28,18 +28,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import sys
 sys.path.append("../")
-from model import Kronos, KronosTokenizer, KronosPredictor
 import quantlab.data.tencent_5min_download as min_download
 from stock_data_fetcher import StockDataFetcher
+from tools.prediction_common import load_model
 
 save_dir = "./examples/data"
 os.makedirs(save_dir, exist_ok=True)
 
 # Setting
-TOKENIZER_PRETRAINED = "NeoQuasar/Kronos-Tokenizer-base"
-MODEL_PRETRAINED = "NeoQuasar/Kronos-base"
-DEVICE =  "cuda:0" # "cpu"  #
-MAX_CONTEXT = 512
 LOOKBACK = 400
 PRED_LEN = 120
 T = 1.0
@@ -208,10 +204,7 @@ def plot_result(df_hist, df_pred, symbol):
 
 
 def predict_future(symbol, freq="daily"):
-    print(f"🚀 Loading Kronos tokenizer:{TOKENIZER_PRETRAINED} model:{MODEL_PRETRAINED} ...")
-    tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_PRETRAINED)
-    model = Kronos.from_pretrained(MODEL_PRETRAINED)
-    predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CONTEXT)
+    predictor = load_model(model_type="base")
 
     df = load_min_data(symbol) if freq == "5min" else load_data(symbol)
     x_df, x_timestamp, y_timestamp = prepare_inputs(df, freq)
